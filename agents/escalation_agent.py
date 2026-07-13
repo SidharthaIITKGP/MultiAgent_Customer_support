@@ -1,0 +1,286 @@
+"""
+agents/escalation_agent.py
+
+Reasons over the FULL react_trace (every Thought/Action/Observation from all agents)
+to decide: auto_resolve / escalate / request_info.
+
+Key behaviors:
+- Reads and cites specific trace evidence in its justification (not just final state)
+- Computes a ConfidenceBreakdown with named components — fully auditable
+- Decision thresholds are driven by the breakdown, not hardcoded rules
+- Generates a final customer-facing response appropriate to the decision
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, SystemMessage
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from agents.state import ConfidenceBreakdown, ReActStep, SupportTicketState
+
+load_dotenv()
+
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sentiment_to_score(sentiment: str) -> float:
+    """Convert sentiment label → numeric 0–1 (higher = better)."""
+    return {"positive": 1.0, "neutral": 0.5, "negative": 0.25, "angry": 0.0}.get(
+        sentiment.lower(), 0.5
+    )
+
+
+def _compute_confidence_breakdown(state: SupportTicketState) -> ConfidenceBreakdown:
+    """
+    Compute the ConfidenceBreakdown from named state components.
+    This is computed deterministically from state — the LLM provides the justification,
+    not the numbers.
+    """
+    retrieval_relevance = float(state.get("retrieval_relevance_score", 0.5))
+
+    tool_calls = state.get("tool_calls_made", [])
+    if tool_calls:
+        successes = sum(1 for tc in tool_calls if (
+            tc.success if hasattr(tc, "success") else tc.get("success", False)
+        ))
+        tool_call_success = successes / len(tool_calls)
+    else:
+        # No tool calls made — neutral score; escalation_agent will reason about why
+        tool_call_success = 0.5
+
+    classification_confidence = float(state.get("classification_confidence", 0.5))
+    sentiment_score = _sentiment_to_score(state.get("sentiment", "neutral"))
+
+    weights = {
+        "retrieval_relevance":       0.20,
+        "tool_call_success":         0.40,
+        "classification_confidence": 0.20,
+        "sentiment_score":           0.20,
+    }
+
+    overall = (
+        retrieval_relevance       * weights["retrieval_relevance"]
+        + tool_call_success       * weights["tool_call_success"]
+        + classification_confidence * weights["classification_confidence"]
+        + sentiment_score         * weights["sentiment_score"]
+    )
+
+    return ConfidenceBreakdown(
+        retrieval_relevance=round(retrieval_relevance, 3),
+        tool_call_success=round(tool_call_success, 3),
+        classification_confidence=round(classification_confidence, 3),
+        sentiment_score=round(sentiment_score, 3),
+        overall=round(overall, 3),
+        weights_used=weights,
+    )
+
+
+ESCALATION_SYSTEM_PROMPT = """You are the Escalation Agent — the final decision-maker in a multi-agent support system.
+
+You receive the COMPLETE reasoning trace from all previous agents. Your job is to:
+1. Decide the outcome: auto_resolve, escalate, or request_info
+2. Write a short justification citing SPECIFIC evidence from the trace (e.g., tool call results, failure messages, sentiment, past ticket history)
+3. Write a final customer-facing response appropriate to the decision
+
+Decision guidelines:
+- auto_resolve: Task was completed successfully, customer's need was met
+- escalate: Tool calls failed, repeated unresolved issues, angry customer + failure, account locked blocking resolution, security concern
+- request_info: Ticket is ambiguous, missing information (order ID, user ID), or customer needs to take an action first
+
+CRITICAL: Your justification must reference SPECIFIC facts from the trace, not generic statements.
+Examples of good justification:
+  "Escalating because action_agent's process_refund call failed with 'Account is locked' (iteration 1) and sentiment is angry. The account lock blocks automated resolution."
+  "Auto-resolving: refund R-A1B2C3D4 was successfully processed in action_agent iteration 2, tool_call_success=1.0, sentiment=neutral."
+  "Requesting info: intake_agent classified with confidence 0.52 (below threshold), ticket lacks an order ID for refund processing."
+
+Respond with this exact JSON:
+{{
+  "decision": "<auto_resolve|escalate|request_info>",
+  "justification": "<2-4 sentences citing specific trace evidence>",
+  "final_response": "<customer-facing response, 2-4 sentences, professional and empathetic>"
+}}"""
+
+
+def _format_trace_for_llm(state: SupportTicketState) -> str:
+    """Format the full react_trace into a readable string for the LLM."""
+    trace = state.get("react_trace", [])
+    lines = []
+    for step in trace:
+        if hasattr(step, "agent"):
+            agent, iteration = step.agent, step.iteration
+            thought, action, observation = step.thought, step.action, step.observation
+        else:
+            agent = step.get("agent", "?")
+            iteration = step.get("iteration", "?")
+            thought = step.get("thought", "")
+            action = step.get("action", "")
+            observation = step.get("observation", "")
+
+        lines.append(
+            f"[{agent.upper()} | iter {iteration}]\n"
+            f"  THOUGHT: {thought[:300]}\n"
+            f"  ACTION:  {action[:200]}\n"
+            f"  OBSERVATION: {observation[:300]}\n"
+        )
+    return "\n".join(lines) if lines else "No trace available."
+
+
+def run_escalation_agent(state: SupportTicketState) -> dict:
+    """LangGraph node function for the escalation agent."""
+
+    llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0, max_output_tokens=1024)
+    new_trace_steps: list[ReActStep] = []
+    existing_trace = state.get("react_trace", [])
+
+    # ---- Compute confidence breakdown deterministically ----
+    confidence_breakdown = _compute_confidence_breakdown(state)
+
+    print(f"\n{'='*60}")
+    print(f"ESCALATION AGENT — ticket: {state.get('ticket_id', 'unknown')}")
+    print(f"Confidence breakdown:")
+    print(f"  retrieval_relevance:       {confidence_breakdown.retrieval_relevance:.3f} (w=0.20)")
+    print(f"  tool_call_success:         {confidence_breakdown.tool_call_success:.3f} (w=0.40)")
+    print(f"  classification_confidence: {confidence_breakdown.classification_confidence:.3f} (w=0.20)")
+    print(f"  sentiment_score:           {confidence_breakdown.sentiment_score:.3f} (w=0.20)")
+    print(f"  OVERALL:                   {confidence_breakdown.overall:.3f}")
+    print(f"{'='*60}")
+
+    # ---- Build the full context for the LLM ----
+    trace_formatted = _format_trace_for_llm(state)
+    tool_calls = state.get("tool_calls_made", [])
+    tool_summary = ""
+    if tool_calls:
+        for tc in tool_calls:
+            if hasattr(tc, "tool_name"):
+                name, success = tc.tool_name, tc.success
+                err = tc.error_message or ""
+            else:
+                name = tc.get("tool_name", "?")
+                success = tc.get("success", False)
+                err = tc.get("error_message", "")
+            status = "SUCCESS" if success else f"FAILED ({err})"
+            tool_summary += f"  - {name}: {status}\n"
+    else:
+        tool_summary = "  No tool calls made.\n"
+
+    context = f"""=== TICKET INFO ===
+Ticket ID: {state.get('ticket_id', 'unknown')}
+User ID: {state.get('user_id', 'unknown')}
+Ticket: {state.get('ticket_text', '')}
+
+=== INTAKE AGENT RESULT ===
+Classification: {state.get('classification', '?')} | Urgency: {state.get('urgency', '?')} | Sentiment: {state.get('sentiment', '?')}
+Confidence: {state.get('classification_confidence', 0):.2f}
+Reasoning: {state.get('intake_reasoning', 'N/A')}
+Past similar tickets: {len(state.get('similar_past_tickets', []))} found
+
+=== KNOWLEDGE AGENT RESULT ===
+Retrieval relevance: {state.get('retrieval_relevance_score', 0):.3f}
+RAG iterations: {state.get('rag_iterations', 0)}
+Reasoning: {state.get('knowledge_reasoning', 'N/A')}
+
+=== ACTION AGENT RESULT ===
+Action success: {state.get('action_success', False)}
+Tool retry count (failures): {state.get('tool_retry_count', 0)}
+Insufficient context flag: {state.get('insufficient_context', False)}
+Final action result: {state.get('action_result', 'N/A')}
+
+Tool calls made:
+{tool_summary}
+=== CONFIDENCE BREAKDOWN ===
+retrieval_relevance: {confidence_breakdown.retrieval_relevance:.3f}
+tool_call_success: {confidence_breakdown.tool_call_success:.3f}
+classification_confidence: {confidence_breakdown.classification_confidence:.3f}
+sentiment_score: {confidence_breakdown.sentiment_score:.3f}
+overall: {confidence_breakdown.overall:.3f}
+
+=== FULL REASONING TRACE ===
+{trace_formatted}"""
+
+    thought_escalation = (
+        f"Reviewing full trace. Overall confidence: {confidence_breakdown.overall:.3f}. "
+        f"Tool success: {confidence_breakdown.tool_call_success:.3f}. "
+        f"Sentiment: {state.get('sentiment', '?')}. "
+        f"Determining escalation decision."
+    )
+    print(f"\nTHOUGHT: {thought_escalation}")
+
+    response = llm.invoke([
+        SystemMessage(content=ESCALATION_SYSTEM_PROMPT),
+        HumanMessage(content=context),
+    ])
+
+    response_text = response.content if isinstance(response.content, str) else str(response.content)
+    print(f"ACTION: escalation_decision(full_trace)")
+    print(f"OBSERVATION: {response_text[:400]}")
+
+    # Parse response
+    result = _parse_escalation_json(response_text)
+
+    # Store in trace
+    step = ReActStep(
+        agent="escalation",
+        iteration=1,
+        thought=thought_escalation,
+        action="escalation_decision(full_trace, confidence_breakdown)",
+        observation=f"decision={result['decision']} | justification={result['justification'][:200]}",
+        timestamp=_now(),
+    )
+    new_trace_steps.append(step)
+
+    print(f"\n{'='*60}")
+    print(f"ESCALATION DECISION: {result['decision'].upper()}")
+    print(f"JUSTIFICATION: {result['justification']}")
+    print(f"FINAL RESPONSE: {result['final_response'][:300]}")
+    print(f"{'='*60}")
+
+    # Store past ticket resolution in memory
+    try:
+        from memory.ticket_memory import store_ticket_resolution
+        store_ticket_resolution(
+            user_id=state.get("user_id", "unknown"),
+            ticket_text=state.get("ticket_text", ""),
+            resolution=result["final_response"],
+            resolved=(result["decision"] == "auto_resolve"),
+        )
+    except Exception as e:
+        print(f"[escalation_agent] Memory store skipped: {e}")
+
+    return {
+        "escalation_decision": result["decision"],
+        "escalation_justification": result["justification"],
+        "confidence_breakdown": confidence_breakdown,
+        "final_response": result["final_response"],
+        "react_trace": existing_trace + new_trace_steps,
+    }
+
+
+def _parse_escalation_json(text: str) -> dict:
+    """Parse escalation decision JSON from LLM response."""
+    # Strip markdown code fences (Gemini wraps JSON in ```json ... ```)
+    cleaned = re.sub(r'```(?:json)?\s*', '', text).strip().rstrip('`').strip()
+    json_match = re.search(r'\{.*?\}', cleaned, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            pass
+    # Fallback
+    return {
+        "decision": "escalate",
+        "justification": "Could not parse escalation response — defaulting to escalate for safety.",
+        "final_response": "We're escalating your ticket to a human agent who will follow up shortly.",
+    }

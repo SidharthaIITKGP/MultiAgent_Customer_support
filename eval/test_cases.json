@@ -1,0 +1,192 @@
+[
+  {
+    "id": "tc_001",
+    "user_id": "u001",
+    "ticket_text": "I need a refund for my order 1001. The item arrived damaged and I'm very disappointed.",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "refund",
+    "expected_urgency": "medium",
+    "description": "Happy path: eligible refund, delivered order, active account",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_002",
+    "user_id": "u003",
+    "ticket_text": "Something is wrong with my account I think. I'm not sure if it's billing or login, things seem off.",
+    "expected_decision": "request_info",
+    "expected_classification": "general",
+    "expected_urgency": "low",
+    "description": "Ambiguous complaint — intake should detect low confidence and flag for clarification",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_003",
+    "user_id": "u004",
+    "ticket_text": "I AM ABSOLUTELY FURIOUS. Nobody has helped me for THREE DAYS. I want to cancel everything and get a full refund RIGHT NOW. This is completely unacceptable.",
+    "expected_decision": "escalate",
+    "expected_classification": "refund",
+    "expected_urgency": "critical",
+    "description": "Angry customer — high urgency, fast escalation path",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_004",
+    "user_id": "u003",
+    "ticket_text": "The app crashes every time I try to log in. I keep getting error E-4023. I've tried clearing cache but it still happens. Running iOS 15 on iPhone 12.",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "technical",
+    "expected_urgency": "medium",
+    "description": "Technical bug — knowledge retrieval heavy, E-4023 troubleshooting steps in KB",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_005",
+    "user_id": "u001",
+    "ticket_text": "Can you check if my order 1001 has been delivered? If it has, I'd like to request a refund for it.",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "refund",
+    "expected_urgency": "low",
+    "description": "Multi-tool: check_order_status THEN process_refund — tests sequential tool use",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_006",
+    "user_id": "u002",
+    "ticket_text": "I need a refund for order 1003. I've been waiting and the item never worked properly.",
+    "expected_decision": "escalate",
+    "expected_classification": "refund",
+    "expected_urgency": "high",
+    "description": "Tool failure + intra-loop retry: u002 account is LOCKED — refund fails, agent must check account status then adapt",
+    "seed_past_tickets": [],
+    "notes": "CRITICAL TEST: action_agent's first refund attempt should fail with 'account locked'. Next Thought must explicitly reason about this and check account status."
+  },
+  {
+    "id": "tc_007",
+    "user_id": "u003",
+    "ticket_text": "I forgot my password and can't log in. Can you send me a reset link? My username is carol_w but I'm not sure of the email on file.",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "account",
+    "expected_urgency": "medium",
+    "description": "Password reset — straightforward, but user doesn't know email on file",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_008",
+    "user_id": "u004",
+    "ticket_text": "I'd like to cancel my premium subscription. I'm not using most of the features anymore and want to switch to basic or cancel entirely.",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "billing",
+    "expected_urgency": "low",
+    "description": "Subscription cancellation — subscription_management.md should be retrieved, update_account called",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_009",
+    "user_id": "u001",
+    "ticket_text": "Where is my order 9999? I placed it last week and haven't received any tracking information.",
+    "expected_decision": "escalate",
+    "expected_classification": "general",
+    "expected_urgency": "medium",
+    "description": "Order not found — order 9999 doesn't exist in mock backend, tool returns 404",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_010",
+    "user_id": "u004",
+    "ticket_text": "Hi! I just wanted to say your team has been amazing. Also, could you update my email address to newemail@example.com? Thanks!",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "account",
+    "expected_urgency": "low",
+    "description": "Positive sentiment, simple account update — tests update_account tool",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_011",
+    "user_id": "u001",
+    "ticket_text": "I already got a refund for order 1001 earlier today but I think something went wrong — can you check and refund it again?",
+    "expected_decision": "request_info",
+    "expected_classification": "refund",
+    "expected_urgency": "low",
+    "description": "Already refunded: order 1001 will have been refunded by tc_001 — tool returns already_processed error",
+    "seed_past_tickets": [],
+    "notes": "Run after tc_001 to ensure refunded=True state is set in mock backend"
+  },
+  {
+    "id": "tc_012",
+    "user_id": "u003",
+    "ticket_text": "There was a charge on my account that seems odd. Could be billing, or maybe it's a subscription thing? Not sure.",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "billing",
+    "expected_urgency": "low",
+    "description": "Vague complaint with billing keyword — low initial confidence, tests knowledge retrieval for billing_faq.md",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_013",
+    "user_id": "u004",
+    "ticket_text": "My enterprise SSO integration keeps failing with a SAML assertion error. The SP entity ID is configured but the IdP metadata URL returns 403.",
+    "expected_decision": "escalate",
+    "expected_classification": "technical",
+    "expected_urgency": "high",
+    "description": "Outside KB scope — SAML/SSO not in knowledge base, low retrieval relevance, insufficient_context=True should trigger",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_014",
+    "user_id": "u003",
+    "ticket_text": "Two things: I need to reset my password AND update my account email to carol_new@example.com.",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "account",
+    "expected_urgency": "medium",
+    "description": "Multi-intent: both reset_password AND update_account needed — tests multi-tool action agent",
+    "seed_past_tickets": []
+  },
+  {
+    "id": "tc_015",
+    "user_id": "u002",
+    "ticket_text": "THIS IS RIDICULOUS. My refund for order 1003 has been rejected AGAIN and I am DONE with this company. Fix this NOW.",
+    "expected_decision": "escalate",
+    "expected_classification": "refund",
+    "expected_urgency": "critical",
+    "description": "Compound: angry sentiment + account locked blocking refund — escalation justification must cite BOTH signals",
+    "seed_past_tickets": [],
+    "notes": "CRITICAL TEST: escalation_justification must mention both the tool failure (account locked) AND the angry sentiment"
+  },
+  {
+    "id": "tc_016",
+    "user_id": "u_repeat",
+    "ticket_text": "The app is crashing again when I try to log in. I keep getting error E-4023. Nothing has worked.",
+    "expected_decision": "escalate",
+    "expected_classification": "technical",
+    "expected_urgency": "high",
+    "description": "Memory-changes-behavior: user u_repeat has 3 prior UNRESOLVED tickets about same E-4023 crash. Intake must detect this from memory and escalate instead of repeating same advice.",
+    "seed_past_tickets": [
+      {"text": "App crashes on login with error E-4023. Cleared cache as advised but still crashing.", "resolution": "Advised customer to clear cache and reinstall.", "resolved": false},
+      {"text": "Still getting E-4023 crash after reinstall. This is very frustrating.", "resolution": "Escalated to tier-2 engineering for investigation.", "resolved": false},
+      {"text": "E-4023 login crash persists after the latest app update. No one has solved this.", "resolution": "Filed internal bug report #BUG-4023.", "resolved": false}
+    ],
+    "eval_assertion": "memory_escalation_triggered",
+    "notes": "CRITICAL TEST: intake_reasoning must reference prior_ticket_count >= 3 or unresolved history. run_eval.py checks this programmatically."
+  },
+  {
+    "id": "tc_017",
+    "user_id": "u001",
+    "ticket_text": "I want a refund for order 1002, and also can you tell me how long standard shipping usually takes? I want to know before I place my next order.",
+    "expected_decision": "auto_resolve",
+    "expected_classification": "refund",
+    "expected_urgency": "low",
+    "description": "Hybrid: refund action + shipping policy question — tests context transfer across knowledge and action agents",
+    "seed_past_tickets": [],
+    "notes": "order 1002 belongs to u003, not u001 — should cause tool failure"
+  },
+  {
+    "id": "tc_018",
+    "user_id": "u003",
+    "ticket_text": "asdfjkl qwerty help me idk what asdf",
+    "expected_decision": "request_info",
+    "expected_classification": "general",
+    "expected_urgency": "low",
+    "description": "Gibberish/empty ticket — graceful handling, should ask for clarification",
+    "seed_past_tickets": []
+  }
+]
