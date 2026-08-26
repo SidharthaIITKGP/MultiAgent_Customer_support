@@ -4,6 +4,15 @@ tests/conftest.py
 Env vars are set BEFORE any project module is imported (db/session.py and
 api.py both read DATABASE_URL/API_KEYS at import time), so this must happen at
 conftest module load time, not inside a fixture.
+
+These are forced (not setdefault), not merely defaulted: the suite needs a
+SPECIFIC, KNOWN set of fake credentials (e.g. two distinct API keys — one
+shared, one dedicated to the rate-limit test so it doesn't collide with other
+tests hammering the same key+endpoint) regardless of whatever the runner's own
+job-level env already exports. CI setting API_KEYS itself is exactly the case
+this must override — with setdefault, that CI value would win and silently
+drop the second key, which is what caused this suite to pass locally (no
+API_KEYS in the shell) but fail in CI (API_KEYS=test-key already exported).
 """
 
 import copy
@@ -11,9 +20,9 @@ import os
 import tempfile
 
 _tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_tmp_db.name}")
-os.environ.setdefault("API_KEYS", "test-key,test-key-ratelimit")
-os.environ.setdefault("GOOGLE_API_KEY", "test-key-not-real")
+os.environ["DATABASE_URL"] = f"sqlite:///{_tmp_db.name}"
+os.environ["API_KEYS"] = "test-key,test-key-ratelimit"
+os.environ["GOOGLE_API_KEY"] = "test-key-not-real"
 
 import pytest  # noqa: E402
 from langchain_core.messages import AIMessage  # noqa: E402
