@@ -190,6 +190,13 @@ CRITICAL INSTRUCTIONS:
    everything you needed? If you needed information that wasn't in the context
    (e.g., specific eligibility rules, policy details), explicitly state this.
 4. Be concrete. Include order IDs, amounts, and results in your final summary.
+5. Each round-trip is expensive — when you're confident an action should succeed (the
+   ticket clearly describes an eligible request), call multiple independent tools in
+   the SAME response rather than checking status, waiting a full turn, then acting
+   in a second turn. The backend enforces eligibility either way, so batching costs
+   nothing when you're right and just becomes your next failure to reason about when
+   you're not. Only go step-by-step when a later call genuinely depends on seeing an
+   earlier result first (e.g., diagnosing why something failed).
 
 Think step by step. Use tools. Reason about failures explicitly."""
 

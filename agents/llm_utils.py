@@ -36,19 +36,24 @@ def build_llm(config: Optional[RunnableConfig], **kwargs: Any) -> ChatGoogleGene
     `config` if one was supplied, otherwise falling back to the GOOGLE_API_KEY
     environment variable (ChatGoogleGenerativeAI's own default behavior).
 
-    Defaults `thinking_level="low"` for Gemini 3+ models. Without this, a
+    Defaults `thinking_level="minimal"` for Gemini 3+ models. Without this, a
     "thinking" model (e.g. gemini-3.5-flash) can spend most of max_output_tokens
     on internal reasoning tokens before writing any visible output, truncating
     the JSON every agent here depends on parsing. This system already elicits
     explicit, externalized reasoning via prompts (react_trace, intake_reasoning,
     etc.) — the model's own hidden chain-of-thought isn't part of that design,
-    so keeping it minimal is correct here, not just a workaround. Callers may
-    override by passing thinking_level explicitly.
+    so keeping it minimal is correct here, not just a workaround. Measured on
+    the intake classification prompt: "minimal" produced valid JSON with 0
+    reasoning tokens (vs 109 at "low") and was faster end-to-end, with no
+    quality loss on that prompt — per-call latency is dominated by network +
+    base generation time, not reasoning depth, so this is a modest but real
+    win that compounds across the ~5-6 sequential calls a full ticket makes.
+    Callers may override by passing thinking_level explicitly.
     """
     api_key = resolve_api_key(config)
     if api_key:
         kwargs["google_api_key"] = api_key
-    kwargs.setdefault("thinking_level", "low")
+    kwargs.setdefault("thinking_level", "minimal")
     return ChatGoogleGenerativeAI(**kwargs)
 
 

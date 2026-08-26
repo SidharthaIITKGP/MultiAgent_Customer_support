@@ -126,6 +126,7 @@ def run_knowledge_agent(state: SupportTicketState, config=None) -> dict:
     current_query = initial_query
     best_context  = ""
     best_score    = 0.0
+    best_sources: list[str] = []
     rag_iterations = 0
 
     logger.info("knowledge_agent start classification=%s urgency=%s", classification, urgency)
@@ -163,6 +164,7 @@ def run_knowledge_agent(state: SupportTicketState, config=None) -> dict:
         if score > best_score:
             best_score   = score
             best_context = context
+            best_sources = sources
 
         if score >= RELEVANCE_THRESHOLD:
             logger.debug("relevance threshold met (%.3f >= %.2f), stopping", score, RELEVANCE_THRESHOLD)
@@ -187,7 +189,20 @@ def run_knowledge_agent(state: SupportTicketState, config=None) -> dict:
 
     # ---- Generate knowledge_reasoning ----
     # The LLM synthesizes what was retrieved and whether it's sufficient
-    reasoning_prompt = f"""You retrieved the following context for this support ticket:
+    # Skip this LLM round-trip when the very first search already cleared the
+    # relevance bar cleanly: action_agent already receives best_context (the
+    # raw retrieved text) directly, so this call is a "reflect on what we just
+    # found" nicety, not something the pipeline functionally depends on. Kept
+    # for the cases where it earns its cost: multi-iteration or weak retrieval,
+    # where an actual synthesis over ambiguous/partial context has real value.
+    if rag_iterations == 1 and best_score >= RELEVANCE_THRESHOLD:
+        knowledge_reasoning = (
+            f"Strong match found on the first search (similarity {best_score:.3f} "
+            f"from {set(best_sources)}) — no reformulation needed. See retrieved_context "
+            f"for the full policy text."
+        )
+    else:
+        reasoning_prompt = f"""You retrieved the following context for this support ticket:
 
 Ticket: {ticket_text}
 Classification: {classification}
@@ -202,11 +217,11 @@ Write a 2-3 sentence summary explaining:
 
 Be concise and factual. This will be passed to the action agent."""
 
-    reasoning_response = build_llm(config, model=MODEL_NAME, temperature=0, max_output_tokens=768).invoke([
-        SystemMessage(content="You are a knowledge synthesis agent."),
-        HumanMessage(content=reasoning_prompt),
-    ])
-    knowledge_reasoning = extract_text(reasoning_response.content)
+        reasoning_response = build_llm(config, model=MODEL_NAME, temperature=0, max_output_tokens=768).invoke([
+            SystemMessage(content="You are a knowledge synthesis agent."),
+            HumanMessage(content=reasoning_prompt),
+        ])
+        knowledge_reasoning = extract_text(reasoning_response.content)
 
     logger.info(
         "knowledge_agent done relevance_score=%.3f iterations=%d",
