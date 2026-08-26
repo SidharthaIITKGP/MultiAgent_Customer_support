@@ -146,10 +146,25 @@ async function send() {
                          action: 'Taking action', escalation: 'Deciding next steps' };
 
   try {
-    const convId = await ensureConversation();
-    const res = await fetch(`/api/conversations/${convId}/messages/stream`, {
+    let convId = await ensureConversation();
+    let res = await fetch(`/api/conversations/${convId}/messages/stream`, {
       method: 'POST', headers: headers(), body: JSON.stringify({ text }),
     });
+
+    // A conversation_id saved in this browser can outlive the server's own
+    // data — e.g. a free-tier host with no persistent disk resets its DB on
+    // every restart/redeploy, but localStorage doesn't know that. Recover by
+    // starting a fresh conversation and retrying once, instead of getting
+    // permanently stuck on a 404 the user can't do anything about.
+    if (res.status === 404) {
+      localStorage.removeItem('conversationId');
+      conversationId = null;
+      convId = await ensureConversation();
+      res = await fetch(`/api/conversations/${convId}/messages/stream`, {
+        method: 'POST', headers: headers(), body: JSON.stringify({ text }),
+      });
+    }
+
     if (res.status === 401) { thinking.remove(); showError('Invalid access code — check Settings.'); settingsDialog.showModal(); return; }
     if (res.status === 429) { thinking.remove(); showError('Rate limited — slow down a bit and try again.'); return; }
     if (!res.ok || !res.body) { thinking.remove(); const t = await res.text(); showError(`Error (${res.status}): ${t.slice(0,200)}`); return; }
