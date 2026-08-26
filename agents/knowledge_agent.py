@@ -23,15 +23,17 @@ from pathlib import Path
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from agents.llm_utils import build_llm, extract_text
 from agents.state import ReActStep, SupportTicketState
+from logging_config import get_logger
 
 load_dotenv()
+logger = get_logger(__name__)
 
-MODEL_NAME   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_NAME   = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 CHROMA_PATH  = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 COLLECTION   = "knowledge_base"
 MAX_RAG_ITER = 3
@@ -97,11 +99,16 @@ Formulate a DIFFERENT, more specific query that would better find:
 Respond with ONLY the new search query (no explanation, just the query string)."""
 
 
-def run_knowledge_agent(state: SupportTicketState) -> dict:
-    """LangGraph node function for the knowledge agent."""
+def run_knowledge_agent(state: SupportTicketState, config=None) -> dict:
+    """LangGraph node function for the knowledge agent.
+
+    `config` intentionally has no type annotation: LangGraph only injects the
+    runtime RunnableConfig into a node if this param is unannotated or typed
+    exactly RunnableConfig/Optional[RunnableConfig] (checked by literal string
+    match, since this module uses `from __future__ import annotations`).
+    """
 
     collection = _get_collection()
-    llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0, max_output_tokens=512)
 
     ticket_text    = state.get("ticket_text", "")
     classification = state.get("classification", "general")
@@ -113,17 +120,15 @@ def run_knowledge_agent(state: SupportTicketState) -> dict:
 
     # Build initial query from the ticket and classification
     initial_query = f"{classification} {ticket_text}"
+    # Combine the raw request with its category to target the appropriate policy
+    # domain without discarding customer-specific details.
 
     current_query = initial_query
     best_context  = ""
     best_score    = 0.0
-    best_sources: list[str] = []
     rag_iterations = 0
 
-    print(f"\n{'='*60}")
-    print(f"KNOWLEDGE AGENT — ticket: {state.get('ticket_id', 'unknown')}")
-    print(f"Classification: {classification} | Urgency: {urgency}")
-    print(f"{'='*60}")
+    logger.info("knowledge_agent start classification=%s urgency=%s", classification, urgency)
 
     for iteration in range(1, MAX_RAG_ITER + 1):
         rag_iterations = iteration
@@ -132,9 +137,8 @@ def run_knowledge_agent(state: SupportTicketState) -> dict:
             f"Relevance threshold: {RELEVANCE_THRESHOLD}. "
             + (f"Previous score was {best_score:.3f} — reformulating." if iteration > 1 else "Initial query.")
         )
-        print(f"\n--- RAG Iteration {iteration}/{MAX_RAG_ITER} ---")
-        print(f"THOUGHT: {thought}")
-        print(f"ACTION: vector_search(query='{current_query}', k={TOP_K})")
+        logger.debug("RAG iteration %d/%d THOUGHT: %s", iteration, MAX_RAG_ITER, thought)
+        logger.debug("ACTION: vector_search(query=%r, k=%d)", current_query, TOP_K)
 
         context, score, sources = _search(collection, current_query, n=TOP_K)
 
@@ -143,7 +147,7 @@ def run_knowledge_agent(state: SupportTicketState) -> dict:
             f"Best similarity: {score:.3f}. "
             f"{'Relevance SUFFICIENT — stopping search.' if score >= RELEVANCE_THRESHOLD else 'Relevance LOW — will reformulate.'}"
         )
-        print(f"OBSERVATION: {observation}")
+        logger.debug("OBSERVATION: %s", observation)
 
         step = ReActStep(
             agent="knowledge",
@@ -159,15 +163,14 @@ def run_knowledge_agent(state: SupportTicketState) -> dict:
         if score > best_score:
             best_score   = score
             best_context = context
-            best_sources = sources
 
         if score >= RELEVANCE_THRESHOLD:
-            print(f"Relevance threshold met ({score:.3f} >= {RELEVANCE_THRESHOLD}). Stopping.")
+            logger.debug("relevance threshold met (%.3f >= %.2f), stopping", score, RELEVANCE_THRESHOLD)
             break
 
         # Need to reformulate — use LLM to generate a better query
         if iteration < MAX_RAG_ITER:
-            refinement_response = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0, max_output_tokens=128).invoke([
+            refinement_response = build_llm(config, model=MODEL_NAME, temperature=0, max_output_tokens=512).invoke([
                 SystemMessage(content="You are a search query refinement specialist."),
                 HumanMessage(content=QUERY_REFINEMENT_PROMPT.format(
                     ticket_text=ticket_text,
@@ -178,11 +181,9 @@ def run_knowledge_agent(state: SupportTicketState) -> dict:
                     prev_context_summary=context[:300] + "..." if len(context) > 300 else context,
                 )),
             ])
-            new_query = refinement_response.content.strip()
-            if isinstance(new_query, list):
-                new_query = " ".join(str(x) for x in new_query)
+            new_query = extract_text(refinement_response.content)
             current_query = new_query[:200]  # cap query length
-            print(f"Reformulated query: '{current_query}'")
+            logger.debug("reformulated query: %r", current_query)
 
     # ---- Generate knowledge_reasoning ----
     # The LLM synthesizes what was retrieved and whether it's sufficient
@@ -201,18 +202,17 @@ Write a 2-3 sentence summary explaining:
 
 Be concise and factual. This will be passed to the action agent."""
 
-    reasoning_response = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0, max_output_tokens=512).invoke([
+    reasoning_response = build_llm(config, model=MODEL_NAME, temperature=0, max_output_tokens=768).invoke([
         SystemMessage(content="You are a knowledge synthesis agent."),
         HumanMessage(content=reasoning_prompt),
     ])
-    knowledge_reasoning = (
-        reasoning_response.content
-        if isinstance(reasoning_response.content, str)
-        else str(reasoning_response.content)
-    )
+    knowledge_reasoning = extract_text(reasoning_response.content)
 
-    print(f"\nKnowledge reasoning: {knowledge_reasoning[:300]}")
-    print(f"Final relevance score: {best_score:.3f} | Iterations: {rag_iterations}")
+    logger.info(
+        "knowledge_agent done relevance_score=%.3f iterations=%d",
+        best_score, rag_iterations,
+    )
+    logger.debug("knowledge_reasoning: %s", knowledge_reasoning[:300])
 
     return {
         "retrieved_context": best_context,

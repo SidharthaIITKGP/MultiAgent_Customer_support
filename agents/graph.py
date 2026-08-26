@@ -17,8 +17,9 @@ recursion_limit=15 is passed at invocation time to fail predictably, not hang.
 
 from __future__ import annotations
 
-import os
+import functools
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,8 +31,11 @@ from agents.intake_agent import run_intake_agent
 from agents.knowledge_agent import run_knowledge_agent
 from agents.action_agent import run_action_agent
 from agents.state import SupportTicketState
+from logging_config import get_logger, set_correlation_id
+from metrics import agent_latency_seconds, record_run_metrics
 
 load_dotenv()
+logger = get_logger(__name__)
 
 GRAPH_RECURSION_LIMIT = 15
 
@@ -52,13 +56,15 @@ def route_after_action(state: SupportTicketState) -> str:
     knowledge_retries = state.get("knowledge_retry_count", 0)
 
     if insufficient and knowledge_retries < 2:
-        print(f"[graph] route_after_action → retry_knowledge (retry #{knowledge_retries + 1})")
+        logger.info("route_after_action -> retry_knowledge (retry #%d)", knowledge_retries + 1)
         return "retry_knowledge"
+    # Only knowledge gaps re-enter RAG; tool failures stay inside the Action
+    # Agent's local ReAct loop to avoid duplicate retries.
 
     if insufficient and knowledge_retries >= 2:
-        print(f"[graph] route_after_action → escalation (knowledge retry limit reached)")
+        logger.info("route_after_action -> escalation (knowledge retry limit reached)")
     else:
-        print(f"[graph] route_after_action → escalation (action complete)")
+        logger.info("route_after_action -> escalation (action complete)")
 
     return "escalation"
 
@@ -67,13 +73,30 @@ def route_after_action(state: SupportTicketState) -> str:
 # Build the graph
 # ---------------------------------------------------------------------------
 
+def _instrument(func, agent_name: str):
+    """Wrap a node function with per-agent latency observation.
+    Uses functools.wraps so inspect.signature (which LangGraph uses to decide
+    whether to inject `config`) follows __wrapped__ back to the original
+    function's signature — the wrapper's own `(state, config=None)` shape is
+    identical anyway, but this keeps it robust if that ever changes.
+    """
+    @functools.wraps(func)
+    def wrapper(state, config=None):
+        start = time.time()
+        try:
+            return func(state, config)
+        finally:
+            agent_latency_seconds.labels(agent=agent_name).observe(time.time() - start)
+    return wrapper
+
+
 def build_graph() -> StateGraph:
     graph = StateGraph(SupportTicketState)
 
-    graph.add_node("intake", run_intake_agent)
-    graph.add_node("knowledge", run_knowledge_agent)
-    graph.add_node("action", run_action_agent)
-    graph.add_node("escalation", run_escalation_agent)
+    graph.add_node("intake", _instrument(run_intake_agent, "intake"))
+    graph.add_node("knowledge", _instrument(run_knowledge_agent, "knowledge"))
+    graph.add_node("action", _instrument(run_action_agent, "action"))
+    graph.add_node("escalation", _instrument(run_escalation_agent, "escalation"))
 
     # Fixed edges
     graph.add_edge(START, "intake")
@@ -107,27 +130,58 @@ def get_compiled_app():
     return _compiled_app
 
 
-def run_graph(initial_state: SupportTicketState) -> SupportTicketState:
+def _build_config(api_key: str | None) -> dict:
+    return {
+        "recursion_limit": GRAPH_RECURSION_LIMIT,
+        "configurable": {"gemini_api_key": api_key},
+    }
+
+
+def run_graph(initial_state: SupportTicketState, api_key: str | None = None) -> SupportTicketState:
     """
     Synchronous invocation. Returns the final state.
     Uses recursion_limit=15 to prevent infinite loops.
+
+    api_key: optional caller-supplied Gemini API key (BYOK). Threaded through
+    LangGraph's `config` — never stored in state — so it never ends up persisted
+    or serialized alongside the ticket trace. Falls back to GOOGLE_API_KEY env
+    var when omitted.
     """
-    app = get_compiled_app()
-    result = app.invoke(
-        initial_state,
-        config={"recursion_limit": GRAPH_RECURSION_LIMIT},
+    set_correlation_id(
+        ticket_id=initial_state.get("ticket_id"),
+        conversation_id=initial_state.get("conversation_id"),
     )
-    return result
-
-
-async def astream_graph(initial_state: SupportTicketState):
-    """
-    Async generator that yields graph chunks for streaming (used by Streamlit frontend).
-    Each chunk is a dict: {node_name: state_updates}
-    """
     app = get_compiled_app()
-    async for chunk in app.astream(
-        initial_state,
-        config={"recursion_limit": GRAPH_RECURSION_LIMIT},
-    ):
-        yield chunk
+    start = time.time()
+    try:
+        result = app.invoke(initial_state, config=_build_config(api_key))
+        record_run_metrics(result, time.time() - start, status="completed")
+        return result
+    except Exception:
+        record_run_metrics({}, time.time() - start, status="error")
+        raise
+
+
+async def astream_graph(initial_state: SupportTicketState, api_key: str | None = None):
+    """
+    Async generator that yields graph chunks for streaming (used by the chat frontend).
+    Each chunk is a dict: {node_name: state_updates}
+
+    api_key: see run_graph().
+    """
+    set_correlation_id(
+        ticket_id=initial_state.get("ticket_id"),
+        conversation_id=initial_state.get("conversation_id"),
+    )
+    app = get_compiled_app()
+    start = time.time()
+    final_state: dict = {}
+    try:
+        async for chunk in app.astream(initial_state, config=_build_config(api_key)):
+            for update in chunk.values():
+                final_state.update(update)
+            yield chunk
+        record_run_metrics(final_state, time.time() - start, status="completed")
+    except Exception:
+        record_run_metrics(final_state, time.time() - start, status="error")
+        raise

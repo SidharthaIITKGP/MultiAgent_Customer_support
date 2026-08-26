@@ -1,0 +1,35 @@
+services:
+  mock-backend:
+    build: .
+    command: uvicorn mock_backend:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    command: sh -c "python knowledge_base/ingest.py && uvicorn api:app --host 0.0.0.0 --port 8001"
+    depends_on:
+      mock-backend:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+    environment:
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      BACKEND_URL: http://mock-backend:8000
+      CHROMA_DB_PATH: /data/chroma_db
+      DATABASE_URL: sqlite:////data/support.db
+      API_KEYS: ${API_KEYS:-devkey-change-me}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - app_data:/data
+      - hf_cache:/root/.cache/huggingface
+
+volumes:
+  app_data:
+  hf_cache:

@@ -15,7 +15,6 @@ the intake_agent to escalate instead of repeating the same resolution.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import uuid
@@ -27,7 +26,10 @@ from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from logging_config import get_logger
+
 load_dotenv()
+logger = get_logger(__name__)
 
 CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 COLLECTION_NAME = "ticket_memory"
@@ -136,7 +138,7 @@ def seed_past_tickets(user_id: str, tickets: list[dict]) -> None:
                 "timestamp":  timestamp,
             }],
         )
-    print(f"[ticket_memory] Seeded {len(tickets)} past tickets for user '{user_id}'")
+    logger.info("seeded %d past tickets for user '%s'", len(tickets), user_id)
 
 
 def clear_user_memory(user_id: str) -> None:
@@ -150,9 +152,9 @@ def clear_user_memory(user_id: str) -> None:
         ids_to_delete = results.get("ids", [])
         if ids_to_delete:
             collection.delete(ids=ids_to_delete)
-            print(f"[ticket_memory] Cleared {len(ids_to_delete)} memories for user '{user_id}'")
+            logger.info("cleared %d memories for user '%s'", len(ids_to_delete), user_id)
     except Exception as e:
-        print(f"[ticket_memory] clear_user_memory error: {e}")
+        logger.warning("clear_user_memory error: %s", e)
 
 
 def get_user_ticket_count(user_id: str) -> int:

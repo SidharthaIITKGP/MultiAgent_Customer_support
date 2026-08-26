@@ -95,6 +95,14 @@ class SupportTicketState(TypedDict, total=False):
     user_id: str
     ticket_text: str
 
+    # ---- Conversation context (this chat's own back-and-forth) ----
+    # Distinct from similar_past_tickets below: that's cross-time memory from
+    # OTHER tickets; these three fields are THIS live chat's own turn history,
+    # assembled by conversation_service.py before invoking the graph.
+    conversation_id: str
+    conversation_history: List[dict]     # [{"role": "user"|"assistant", "content": str}, ...]
+    previous_turn_requested_info: bool   # True if the prior turn's escalation_decision was request_info
+
     # ---- Intake Agent outputs ----
     classification: str           # billing | technical | refund | account | general
     urgency: str                  # low | medium | high | critical
@@ -137,6 +145,8 @@ class SupportTicketState(TypedDict, total=False):
 
 def state_to_dict(state: SupportTicketState) -> dict:
     """Convert state to a JSON-serializable dict for API responses."""
+    # Copy first so response serialization never mutates the live graph state,
+    # which may still contain Pydantic model instances.
     result = dict(state)
 
     # Convert Pydantic models to dicts

@@ -28,9 +28,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from agents.graph import run_graph
-from agents.state import state_to_dict
-from memory.ticket_memory import clear_user_memory, seed_past_tickets
+from agents.graph import run_graph  # noqa: E402
+from agents.state import state_to_dict  # noqa: E402
+from memory.ticket_memory import clear_user_memory, seed_past_tickets  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +42,8 @@ TEST_CASES_PATH = Path(__file__).parent / "test_cases.json"
 
 def load_test_cases(filter_ids: list[str] | None = None) -> list[dict]:
     cases = json.loads(TEST_CASES_PATH.read_text())
+    # Filtering supports full benchmarks and focused regression runs using the
+    # same fixture file.
     if filter_ids:
         cases = [c for c in cases if c["id"] in filter_ids]
     return cases
@@ -120,7 +122,7 @@ def run_single(tc: dict, reset_backend: bool = True) -> dict:
         keywords = ["prior", "repeat", "history", "previous", "unresolved", "past", "again", "multiple"]
         memory_escalation_triggered = any(kw in intake_reasoning for kw in keywords)
         if not memory_escalation_triggered:
-            print(f"  ⚠️  TC-016 ASSERTION FAILED: intake_reasoning doesn't reference past ticket history!")
+            print("  ⚠️  TC-016 ASSERTION FAILED: intake_reasoning doesn't reference past ticket history!")
             print(f"     intake_reasoning: {intake_reasoning[:200]}")
 
     # ---- Print result summary ----
@@ -171,7 +173,6 @@ def print_summary(results: list[dict]) -> None:
     n_correct = sum(1 for r in results if r["decision_correct"])
     decision_accuracy = n_correct / n_total if n_total else 0
 
-    all_tool_calls = [r["n_tool_calls"] for r in results if r["n_tool_calls"] > 0]
     all_success_rates = [r["tool_success_rate"] for r in results if r["tool_success_rate"] is not None]
     all_latencies = [r["latency_s"] for r in results]
     all_relevances = [r["retrieval_relevance"] for r in results if r["retrieval_relevance"] is not None]
@@ -186,7 +187,7 @@ def print_summary(results: list[dict]) -> None:
     print(f"⏱  Avg Latency:            {sum(all_latencies)/len(all_latencies):.1f}s")
     print(f"📚 Avg Retrieval Relevance: {sum(all_relevances)/len(all_relevances):.3f}" if all_relevances else "📚 Avg Retrieval Relevance: N/A")
 
-    print(f"\n📈 Avg ReAct iterations per agent:")
+    print("\n📈 Avg ReAct iterations per agent:")
     for agent, iters in sorted(avg_iter.items()):
         print(f"    {agent}: {sum(iters)/len(iters):.1f} avg (max {max(iters)})")
 

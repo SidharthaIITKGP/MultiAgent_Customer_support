@@ -1,0 +1,12 @@
+.venv
+venv
+__pycache__
+*.pyc
+chroma_db
+data
+.git
+.env
+.env.local
+eval/eval_results.json
+tests
+node_modules

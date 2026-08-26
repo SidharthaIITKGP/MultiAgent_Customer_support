@@ -1,3 +1,13 @@
+---
+title: Multi Agent Customer Support System
+emoji: 🤖
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Multi-Agent Customer Support System
 
 A portfolio-grade multi-agent AI system built to demonstrate **explicit ReAct reasoning**, **real LLM tool-calling**, **multi-agent orchestration with LangGraph**, and **retrieval-augmented reasoning** — all wired together into a live demo with streaming trace output.
@@ -151,20 +161,31 @@ support-agent-system/
 │   └── ingest.py                # ChromaDB ingestion with all-MiniLM-L6-v2
 ├── agents/
 │   ├── state.py                 # LangGraph shared state (Pydantic + TypedDict)
-│   ├── intake_agent.py          # ReAct classification + memory retrieval
+│   ├── llm_utils.py             # Single LLM-construction seam: build_llm() (BYOK), extract_text()
+│   ├── intake_agent.py          # ReAct classification + memory + conversation context
 │   ├── knowledge_agent.py       # RAG loop (max 3 iterations, cosine similarity check)
 │   ├── action_agent.py          # ReAct tool-calling loop (max 5 iterations)
 │   ├── escalation_agent.py      # Trace-aware decision with ConfidenceBreakdown
 │   └── graph.py                 # StateGraph with conditional edges, recursion_limit=15
 ├── memory/
 │   └── ticket_memory.py         # Per-user past ticket embeddings in ChromaDB
+├── db/                          # Persistence: conversations, messages, ticket runs
+│   ├── models.py                # SQLAlchemy models (SQLite by default, Postgres via DATABASE_URL)
+│   ├── session.py
+│   └── crud.py
+├── conversation_service.py      # Multi-turn composition logic (ticket_text chaining, history)
+├── auth.py                      # Shared-secret X-API-Key auth for /api/*
+├── metrics.py                   # Prometheus counters/histograms
+├── logging_config.py            # Structured JSON logging with correlation ids
+├── api.py                       # FastAPI gateway: /api/conversations, .../messages, .../stream
+├── frontend/
+│   └── web/                     # Static chat UI (vanilla HTML/CSS/JS, no build step)
 ├── eval/
 │   ├── test_cases.json          # 18 test cases (incl. TC-16 memory behavior test)
-│   └── run_eval.py              # Metrics: accuracy, tool success, latency, retrieval relevance
-├── api.py                       # FastAPI gateway (POST /ticket, GET /ticket/{id}/trace)
-├── frontend/
-│   └── app.py                   # Streamlit with live trace streaming
-├── requirements.txt
+│   └── run_eval.py              # Live-API qualitative benchmark: accuracy, tool success, latency
+├── tests/                       # pytest suite — fast, deterministic, no live API calls
+├── Dockerfile / docker-compose.yml / .github/workflows/ci.yml
+├── requirements.txt / requirements-dev.txt
 └── README.md
 ```
 
@@ -173,77 +194,91 @@ support-agent-system/
 ## Setup & Running
 
 ### Prerequisites
-- Python 3.11+
-- `ANTHROPIC_API_KEY`
+- Python 3.12+
+- A `GOOGLE_API_KEY` (Gemini). Free-tier quotas are small (as low as 20 requests/day on some models) — see BYOK below.
 
 ### 1. Clone and install
 ```bash
 git clone <repo>
 cd support-agent-system
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # includes requirements.txt + pytest/ruff
 ```
 
 ### 2. Configure
 ```bash
 cp .env.example .env
-# Edit .env: add your ANTHROPIC_API_KEY
-# Optionally change CLAUDE_MODEL (default: claude-sonnet-4-5)
+# Edit .env: add your GOOGLE_API_KEY, and set API_KEYS to a real secret
+# (API_KEYS gates every /api/* route, including calls from the chat UI itself —
+#  see "Auth & BYOK" below)
 ```
 
 ### 3. Ingest knowledge base
 ```bash
 python knowledge_base/ingest.py
-# Optional: test a query
-python knowledge_base/ingest.py --test-query "how do I get a refund"
 ```
 
 ### 4. Start the mock backend
 ```bash
 uvicorn mock_backend:app --port 8000 --reload
-# Test: curl http://localhost:8000/account/u001
-# Test: curl http://localhost:8000/order/1001
 ```
 
-### 5. Test the Action Agent in isolation *(see the ReAct trace first)*
+### 5. Run the API + chat UI
 ```bash
-python -m agents.action_agent
+python api.py
+# Open http://localhost:8001 — the chat UI is served from there.
+# On first load it asks for the access code (your API_KEYS value) and,
+# optionally, your own Gemini key.
 ```
-This runs two test cases and prints the full Thought/Action/Observation trace.
 
-### 6. Run the full evaluation
+### 6. Run tests
+```bash
+pytest -q          # fast, mocked, no live API calls
+ruff check .
+```
+
+### 7. Run the live evaluation (uses real Gemini + mock backend)
 ```bash
 python eval/run_eval.py
 # Or specific cases:
 python eval/run_eval.py --cases tc_006 tc_016
 ```
 
-### 7. Run the Streamlit frontend
+### 8. Or run everything in Docker
 ```bash
-streamlit run frontend/app.py
-```
-
-### 8. (Optional) Run the API server
-```bash
-python api.py
-# POST /ticket
-curl -X POST http://localhost:8001/ticket \
-  -H "Content-Type: application/json" \
-  -d '{"ticket_text": "Refund for order 1001", "user_id": "u001"}'
+docker compose up --build
+# mock backend on :8000, API + chat UI on :8001
 ```
 
 ---
 
-## Key Demo Points for Interviewers
+## Auth & BYOK
 
-1. **Visible ReAct trace** — point at the Streamlit frontend: every agent's Thought → Action → Observation is shown live as it happens.
+Every `/api/*` route (including calls the chat UI itself makes) requires an
+`X-API-Key` header matching one of the comma-separated values in `API_KEYS`.
+This isn't user auth (there's no login system) — it's a shared-secret gate so
+the demo isn't open to the whole internet. The chat UI asks for it once as an
+"access code" and stores it in `localStorage`.
+
+Separately, a visitor can supply their **own** Gemini API key via the chat UI's
+settings panel (sent as `X-Gemini-Api-Key`) to run on their own quota instead of
+the operator's. This key is threaded through LangGraph's `config` object
+(`agents/llm_utils.py`) — it is never written to state, the database, or logs.
+
+---
+
+## Key Demo Points
+
+1. **Visible ReAct trace** — every agent's Thought → Action → Observation, streamed live via SSE (`POST /api/conversations/{id}/messages/stream`) and stored per-turn in the `tickets` table.
 
 2. **Real tool-calling** — `model.bind_tools(ALL_TOOLS)` — the LLM decides which tool to call and with what arguments, not hardcoded dispatch.
 
-3. **Tool failure + visible adaptation** — load TC-06 (user u002, locked account). Watch the Action Agent's Thought in iteration 3 explicitly say "the refund failed because the account is LOCKED — I need to check account status first."
+3. **Tool failure + visible adaptation** — load TC-06 (user u002, locked account). Watch the Action Agent's Thought explicitly reason about the "account is LOCKED" failure before trying a different tool.
 
-4. **Memory-driven escalation** — run TC-16 in eval. The intake agent retrieves 3 unresolved prior tickets and adjusts its reasoning before the ticket even reaches the action agent.
+4. **Multi-turn conversation continuity** — ask for a refund without an order ID; the escalation agent responds with `request_info`; your next message ("1005") is automatically chained onto the original ticket text (`conversation_service.py`) so the agents see the full thread, not a context-free fragment.
 
-5. **ConfidenceBreakdown** — every escalation decision shows named components (retrieval_relevance, tool_call_success, classification_confidence, sentiment_score) and cites specific trace evidence in its justification.
+5. **Memory-driven escalation** — run TC-16 in eval. The intake agent retrieves prior unresolved tickets and adjusts its reasoning before the ticket even reaches the action agent.
+
+6. **ConfidenceBreakdown** — every escalation decision shows named components (retrieval_relevance, tool_call_success, classification_confidence, sentiment_score) and cites specific trace evidence in its justification.
 
 ---
 
@@ -252,10 +287,18 @@ curl -X POST http://localhost:8001/ticket \
 | Component | Technology |
 |---|---|
 | Orchestration | LangGraph (StateGraph) |
-| LLM | Anthropic Claude (configurable via `CLAUDE_MODEL` in `.env`) |
+| LLM | Google Gemini (configurable via `GEMINI_MODEL`; BYOK supported per-request) |
 | Tool-calling | LangChain `model.bind_tools()` + `@tool` decorator |
 | Vector DB | ChromaDB (local, persistent) |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2` (local, no API cost) |
-| Backend | FastAPI (in-memory, ~130 lines) |
-| Frontend | Streamlit |
+| Persistence | SQLAlchemy (SQLite by default, Postgres via `DATABASE_URL`) |
+| Backend | FastAPI — auth (`X-API-Key`), rate limiting (`slowapi`), SSE streaming |
+| Observability | Structured JSON logs with correlation ids, Prometheus metrics at `/metrics` |
+| Frontend | Static HTML/CSS/vanilla JS chat UI, no build step |
+| Tests | pytest (mocked LLM, in-process mock backend, temp SQLite/Chroma) |
+| Packaging | Docker + docker-compose, GitHub Actions CI |
 | State schema | Pydantic + TypedDict |
+
+Note: `eval/run_eval.py` is a separate, deliberately live-API qualitative
+benchmark (real Gemini calls, real mock backend) — not part of the CI-safe
+`pytest` suite, which never makes a real LLM call.

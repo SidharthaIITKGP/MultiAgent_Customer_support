@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["e2e: exercises real ChromaDB retrieval (no live LLM calls)"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+# Pin to ruff's own documented default rule set (pycodestyle errors + pyflakes).
+# This project predates ruff adoption; broader rule sets (pylint, bandit,
+# pyupgrade, import-sorting, ...) would relitigate pre-existing style across
+# files this change didn't touch rather than catch real bugs.
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E501"]

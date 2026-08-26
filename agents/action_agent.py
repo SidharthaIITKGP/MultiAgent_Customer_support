@@ -19,14 +19,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -37,16 +36,19 @@ from langchain_core.messages import (
 from langchain_core.tools import tool
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from agents.llm_utils import build_llm, extract_text
 from agents.state import ReActStep, SupportTicketState, ToolCallRecord
+from logging_config import get_logger
 
 load_dotenv()
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 MAX_ITERATIONS = 5
 
 # ---------------------------------------------------------------------------
@@ -153,6 +155,8 @@ ALL_TOOLS = [
 ]
 
 TOOL_MAP = {t.name: t for t in ALL_TOOLS}
+# Resolve model-supplied names at runtime while keeping one tool list for model
+# binding and execution.
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -200,16 +204,9 @@ def _extract_thought(message: AIMessage, tool_calls: list | None = None) -> str:
     Gemini often returns empty text when making tool calls (unlike Claude).
     In that case, we synthesize a thought from the tool call intent.
     """
-    content = message.content
-    if isinstance(content, str) and content.strip():
-        return content.strip()
-    if isinstance(content, list):
-        text_parts = [
-            block["text"] for block in content
-            if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip()
-        ]
-        if text_parts:
-            return " ".join(text_parts).strip()
+    text = extract_text(message.content)
+    if text:
+        return text
 
     # Gemini gave no text — synthesize from tool call names for a readable trace
     tc_list = tool_calls or (message.tool_calls if hasattr(message, 'tool_calls') else [])
@@ -226,12 +223,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_action_agent(state: SupportTicketState) -> dict:
+def run_action_agent(state: SupportTicketState, config=None) -> dict:
     """
     LangGraph node function.
     Runs the ReAct loop and returns state updates.
+
+    `config` intentionally has no type annotation: LangGraph only injects the
+    runtime RunnableConfig into a node if this param is unannotated or typed
+    exactly RunnableConfig/Optional[RunnableConfig] (checked by literal string
+    match, since this module uses `from __future__ import annotations`).
     """
-    llm = ChatGoogleGenerativeAI(
+    llm = build_llm(
+        config,
         model=MODEL_NAME,
         temperature=0,
         max_output_tokens=4096,
@@ -262,20 +265,17 @@ def run_action_agent(state: SupportTicketState) -> dict:
     action_success = False
     insufficient_context = False
 
-    print(f"\n{'='*60}")
-    print(f"ACTION AGENT — ticket: {state.get('ticket_id', 'unknown')}")
-    print(f"Model: {MODEL_NAME} | Max iterations: {MAX_ITERATIONS}")
-    print(f"{'='*60}")
+    logger.info("action_agent start model=%s max_iterations=%d", MODEL_NAME, MAX_ITERATIONS)
 
     for iteration in range(1, MAX_ITERATIONS + 1):
-        print(f"\n--- Iteration {iteration}/{MAX_ITERATIONS} ---")
+        logger.debug("action iteration %d/%d", iteration, MAX_ITERATIONS)
 
         # Get LLM response
         response: AIMessage = llm.invoke(messages)
         messages.append(response)
 
         thought = _extract_thought(response, response.tool_calls)
-        print(f"THOUGHT: {thought}")
+        logger.debug("THOUGHT: %s", thought)
 
         # Check if LLM wants to call tools
         if not response.tool_calls:
@@ -292,8 +292,8 @@ def run_action_agent(state: SupportTicketState) -> dict:
                 timestamp=_now(),
             )
             new_trace_steps.append(step)
-            print(f"ACTION: {action}")
-            print(f"OBSERVATION: {observation[:200]}...")
+            logger.debug("ACTION: %s", action)
+            logger.debug("OBSERVATION: %s...", observation[:200])
             action_result = thought
             action_success = True  # Completed without error
             break
@@ -305,7 +305,7 @@ def run_action_agent(state: SupportTicketState) -> dict:
             tool_name = tc["name"]
             tool_args = tc["args"]
             action_str = f"{tool_name}({json.dumps(tool_args)})"
-            print(f"ACTION: {action_str}")
+            logger.debug("ACTION: %s", action_str)
 
             # Execute the tool
             tool_fn = TOOL_MAP.get(tool_name)
@@ -324,7 +324,7 @@ def run_action_agent(state: SupportTicketState) -> dict:
                 tool_retry_count += 1
 
             observation_str = json.dumps(raw_result, indent=2)
-            print(f"OBSERVATION: {observation_str[:300]}")
+            logger.debug("OBSERVATION: %s", observation_str[:300])
 
             # Record the tool call
             tool_calls_made.append(ToolCallRecord(
@@ -366,7 +366,7 @@ def run_action_agent(state: SupportTicketState) -> dict:
 
     else:
         # Max iterations reached without breaking
-        print(f"\nMax iterations ({MAX_ITERATIONS}) reached.")
+        logger.warning("max iterations (%d) reached", MAX_ITERATIONS)
         action_result = f"Max iterations reached. Last status: {action_result}"
 
     # ---------------------------------------------------------------------------
@@ -393,12 +393,12 @@ Respond with EXACTLY this JSON format:
   "reason": "brief explanation of what was missing (if insufficient) or confirmation (if sufficient)"
 }}"""
 
-    eval_response = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0, max_output_tokens=256).invoke([
+    eval_response = build_llm(config, model=MODEL_NAME, temperature=0, max_output_tokens=512).invoke([
         SystemMessage(content="You are evaluating whether retrieved context was sufficient."),
         HumanMessage(content=context_eval_prompt),
     ])
 
-    eval_text = eval_response.content if isinstance(eval_response.content, str) else str(eval_response.content)
+    eval_text = extract_text(eval_response.content)
     insufficient_context = False
     context_eval_reason = "Context evaluation not parseable."
 
@@ -410,8 +410,8 @@ Respond with EXACTLY this JSON format:
             eval_json = json.loads(json_match.group())
             insufficient_context = bool(eval_json.get("insufficient_context", False))
             context_eval_reason = eval_json.get("reason", "")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("context sufficiency eval unparseable: %s", e)
 
     # Add a final reflection step to the trace
     new_trace_steps.append(ReActStep(
@@ -423,10 +423,10 @@ Respond with EXACTLY this JSON format:
         timestamp=_now(),
     ))
 
-    print(f"\n--- Context evaluation ---")
-    print(f"insufficient_context: {insufficient_context}")
-    print(f"reason: {context_eval_reason}")
-    print(f"\nAction agent complete. success={action_success}, tool_calls={len(tool_calls_made)}")
+    logger.info(
+        "action_agent done success=%s tool_calls=%d insufficient_context=%s reason=%s",
+        action_success, len(tool_calls_made), insufficient_context, context_eval_reason,
+    )
 
     # Merge with existing trace
     existing_trace = state.get("react_trace", [])
@@ -470,7 +470,7 @@ if __name__ == "__main__":
     }
 
     result_1 = run_action_agent(test_state_1)
-    print(f"\n✓ Test 1 complete.")
+    print("\n✓ Test 1 complete.")
     print(f"  action_success: {result_1['action_success']}")
     print(f"  action_result: {result_1['action_result']}")
     print(f"  tool_calls: {len(result_1['tool_calls_made'])}")
@@ -497,7 +497,7 @@ if __name__ == "__main__":
     }
 
     result_2 = run_action_agent(test_state_2)
-    print(f"\n✓ Test 2 complete.")
+    print("\n✓ Test 2 complete.")
     print(f"  action_success: {result_2['action_success']}")
     print(f"  action_result: {result_2['action_result']}")
     print(f"  tool_retry_count (failures): {result_2['tool_retry_count']}")

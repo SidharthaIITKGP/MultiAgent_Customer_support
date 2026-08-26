@@ -1,28 +1,38 @@
 """
 api.py — FastAPI gateway for the Multi-Agent Customer Support System.
 
-Single endpoint:
-  POST /ticket — runs the LangGraph, returns full reasoning trace as JSON
-
-Storage: in-memory dict (no DB, no auth, keeps it lean).
+All JSON/SSE routes live under /api/* (auth + rate-limited). The chat frontend
+is served as static files at "/" and "/web/*". /health and /metrics are open,
+unauthenticated infra endpoints.
 """
 
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timezone
+import json
 
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from prometheus_client import make_asgi_app
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from sqlalchemy.orm import Session
 
-from agents.graph import run_graph
-from agents.state import SupportTicketState, state_to_dict
+import conversation_service
+import db.crud as crud
+from auth import require_api_key
+from db.session import get_db, init_db
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 app = FastAPI(
     title="Multi-Agent Customer Support System",
-    description="LangGraph-powered multi-agent support system with explicit ReAct traces",
-    version="1.0.0",
+    description="LangGraph-powered multi-agent support chat with explicit ReAct traces",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -32,122 +42,246 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory ticket store
-_ticket_store: dict[str, dict] = {}
+
+@app.on_event("startup")
+def _startup() -> None:
+    init_db()
 
 
 # ---------------------------------------------------------------------------
-# Request / Response schemas
+# Rate limiting — keyed by X-API-Key, falls back to remote address
 # ---------------------------------------------------------------------------
+
+def _rate_limit_key(request: Request) -> str:
+    return request.headers.get("x-api-key") or get_remote_address(request)
+
+
+limiter = Limiter(key_func=_rate_limit_key)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def _gemini_api_key(x_gemini_api_key: str = Header(default="", alias="X-Gemini-Api-Key")) -> str | None:
+    """
+    BYOK: optional caller-supplied Gemini key. Never logged, never persisted —
+    read once here and threaded straight into conversation_service, which
+    threads it into the graph's `config` (see agents/llm_utils.py).
+    """
+    return x_gemini_api_key or None
+
+
+# ---------------------------------------------------------------------------
+# Request/response schemas
+# ---------------------------------------------------------------------------
+
+class CreateConversationRequest(BaseModel):
+    user_id: str = "u_anonymous"
+
+
+class SendMessageRequest(BaseModel):
+    text: str
+
 
 class TicketRequest(BaseModel):
     ticket_text: str
     user_id: str = "u_anonymous"
 
 
-class TicketResponse(BaseModel):
-    ticket_id: str
-    status: str
-    escalation_decision: str | None = None
-    final_response: str | None = None
-    react_trace_length: int = 0
-    processing_time_s: float = 0.0
-
-
 # ---------------------------------------------------------------------------
-# Endpoints
+# Open, unauthenticated infra endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "stored_tickets": len(_ticket_store)}
-
-
-@app.post("/ticket", response_model=TicketResponse)
-def submit_ticket(req: TicketRequest):
-    """
-    Run a support ticket through the full LangGraph pipeline.
-    Returns the ticket ID and summary — use GET /ticket/{id}/trace for the full trace.
-    """
-    import time
-
-    ticket_id = f"TKT-{uuid.uuid4().hex[:8].upper()}"
-    start = time.time()
-
-    initial_state: SupportTicketState = {
-        "ticket_id": ticket_id,
-        "user_id": req.user_id,
-        "ticket_text": req.ticket_text,
-        "react_trace": [],
-        "tool_calls_made": [],
-        "knowledge_retry_count": 0,
-        "tool_retry_count": 0,
-        "insufficient_context": False,
-    }
-
+def health(db: Session = Depends(get_db)):
     try:
-        final_state = run_graph(initial_state)
-        elapsed = time.time() - start
-        serialized = state_to_dict(final_state)
-        serialized["processing_time_s"] = round(elapsed, 2)
-        serialized["submitted_at"] = datetime.now(timezone.utc).isoformat()
-        _ticket_store[ticket_id] = serialized
-
-        return TicketResponse(
-            ticket_id=ticket_id,
-            status="completed",
-            escalation_decision=serialized.get("escalation_decision"),
-            final_response=serialized.get("final_response"),
-            react_trace_length=len(serialized.get("react_trace", [])),
-            processing_time_s=round(elapsed, 2),
-        )
-    except Exception as e:
-        elapsed = time.time() - start
-        _ticket_store[ticket_id] = {
-            "ticket_id": ticket_id,
-            "error": str(e),
-            "status": "error",
-            "submitted_at": datetime.now(timezone.utc).isoformat(),
-        }
-        raise HTTPException(status_code=500, detail=str(e))
+        crud.list_conversations(db, limit=1)  # touch the DB to confirm connectivity
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return {"status": "ok" if db_ok else "degraded", "db_ok": db_ok}
 
 
-@app.get("/ticket/{ticket_id}")
-def get_ticket_summary(ticket_id: str):
-    """Get ticket summary without the full trace."""
-    if ticket_id not in _ticket_store:
-        raise HTTPException(status_code=404, detail=f"Ticket '{ticket_id}' not found")
-    data = _ticket_store[ticket_id]
-    # Return without the full trace for brevity
-    return {k: v for k, v in data.items() if k != "react_trace"}
+app.mount("/metrics", make_asgi_app())
+
+# ---------------------------------------------------------------------------
+# Static chat frontend
+# ---------------------------------------------------------------------------
+
+app.mount("/web", StaticFiles(directory="frontend/web"), name="web")
 
 
-@app.get("/ticket/{ticket_id}/trace")
-def get_ticket_trace(ticket_id: str):
-    """Get the FULL reasoning trace for a ticket — every Thought/Action/Observation."""
-    if ticket_id not in _ticket_store:
-        raise HTTPException(status_code=404, detail=f"Ticket '{ticket_id}' not found")
-    return _ticket_store[ticket_id]
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse("frontend/web/index.html")
 
 
-@app.get("/tickets")
-def list_tickets():
-    """List all processed tickets (summary only)."""
+# ---------------------------------------------------------------------------
+# Authenticated API router
+# ---------------------------------------------------------------------------
+
+api = APIRouter(prefix="/api", dependencies=[Depends(require_api_key)])
+
+
+@api.post("/conversations")
+@limiter.limit("20/minute")
+def create_conversation(request: Request, body: CreateConversationRequest, db: Session = Depends(get_db)):
+    conv = crud.create_conversation(db, user_id=body.user_id)
+    return {"conversation_id": conv.id, "user_id": conv.user_id, "status": conv.status}
+
+
+@api.get("/conversations")
+@limiter.limit("60/minute")
+def list_conversations_endpoint(
+    request: Request,
+    user_id: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    convs = crud.list_conversations(db, user_id=user_id, limit=limit, offset=offset)
     return [
-        {
-            "ticket_id": tid,
-            "submitted_at": data.get("submitted_at"),
-            "decision": data.get("escalation_decision"),
-            "classification": data.get("classification"),
-            "status": data.get("status", "completed"),
-        }
-        for tid, data in _ticket_store.items()
+        {"conversation_id": c.id, "user_id": c.user_id, "status": c.status,
+         "awaiting_customer_input": c.awaiting_customer_input, "updated_at": c.updated_at.isoformat()}
+        for c in convs
     ]
 
 
+@api.get("/conversations/{conversation_id}")
+@limiter.limit("60/minute")
+def get_conversation_endpoint(
+    request: Request,
+    conversation_id: str,
+    include_trace: bool = False,
+    db: Session = Depends(get_db),
+):
+    conv = crud.get_conversation(db, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail=f"Conversation '{conversation_id}' not found")
+    messages = crud.list_messages(db, conversation_id)
+    result_messages = []
+    for m in messages:
+        entry = {"id": m.id, "role": m.role, "content": m.content, "ticket_id": m.ticket_id,
+                  "created_at": m.created_at.isoformat()}
+        if include_trace and m.ticket_id:
+            run = crud.get_ticket_run(db, m.ticket_id)
+            if run:
+                entry["state"] = run.state_json
+        result_messages.append(entry)
+    return {
+        "conversation_id": conv.id,
+        "user_id": conv.user_id,
+        "status": conv.status,
+        "awaiting_customer_input": conv.awaiting_customer_input,
+        "messages": result_messages,
+    }
+
+
+@api.post("/conversations/{conversation_id}/messages")
+@limiter.limit("10/minute")
+def send_message(
+    request: Request,
+    conversation_id: str,
+    body: SendMessageRequest,
+    db: Session = Depends(get_db),
+    gemini_api_key: str | None = Depends(_gemini_api_key),
+):
+    conv = crud.get_conversation(db, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail=f"Conversation '{conversation_id}' not found")
+    try:
+        run, assistant_msg = conversation_service.run_turn(db, conv, body.text, gemini_api_key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "ticket_id": run.ticket_id,
+        "assistant_message": {"id": assistant_msg.id, "content": assistant_msg.content},
+        "escalation_decision": run.escalation_decision,
+        "processing_time_s": run.processing_time_s,
+    }
+
+
+@api.post("/conversations/{conversation_id}/messages/stream")
+@limiter.limit("10/minute")
+async def send_message_stream(
+    request: Request,
+    conversation_id: str,
+    body: SendMessageRequest,
+    db: Session = Depends(get_db),
+    gemini_api_key: str | None = Depends(_gemini_api_key),
+):
+    conv = crud.get_conversation(db, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail=f"Conversation '{conversation_id}' not found")
+
+    async def event_stream():
+        async for frame in conversation_service.stream_turn(db, conv, body.text, gemini_api_key):
+            yield f"data: {json.dumps(frame, default=str)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 # ---------------------------------------------------------------------------
-# Run directly
+# Back-compat single-shot ticket endpoints (Streamlit's old contract)
 # ---------------------------------------------------------------------------
+
+@api.post("/ticket", deprecated=True)
+@limiter.limit("10/minute")
+def submit_ticket(request: Request, body: TicketRequest, db: Session = Depends(get_db),
+                   gemini_api_key: str | None = Depends(_gemini_api_key)):
+    """Deprecated: creates a single-turn conversation under the hood."""
+    conv = crud.create_conversation(db, user_id=body.user_id)
+    try:
+        run, assistant_msg = conversation_service.run_turn(db, conv, body.ticket_text, gemini_api_key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "ticket_id": run.ticket_id,
+        "conversation_id": conv.id,
+        "status": "completed",
+        "escalation_decision": run.escalation_decision,
+        "final_response": assistant_msg.content,
+        "processing_time_s": run.processing_time_s,
+    }
+
+
+@api.get("/ticket/{ticket_id}")
+@limiter.limit("60/minute")
+def get_ticket_summary(request: Request, ticket_id: str, db: Session = Depends(get_db)):
+    run = crud.get_ticket_run(db, ticket_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Ticket '{ticket_id}' not found")
+    return {k: v for k, v in run.state_json.items() if k != "react_trace"} | {
+        "ticket_id": run.ticket_id,
+        "conversation_id": run.conversation_id,
+        "status": run.status,
+        "processing_time_s": run.processing_time_s,
+    }
+
+
+@api.get("/ticket/{ticket_id}/trace")
+@limiter.limit("60/minute")
+def get_ticket_trace(request: Request, ticket_id: str, db: Session = Depends(get_db)):
+    run = crud.get_ticket_run(db, ticket_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Ticket '{ticket_id}' not found")
+    return run.state_json
+
+
+@api.get("/tickets")
+@limiter.limit("60/minute")
+def list_tickets(request: Request, user_id: str | None = None, limit: int = 20,
+                  offset: int = 0, db: Session = Depends(get_db)):
+    runs = crud.list_ticket_runs(db, user_id=user_id, limit=limit, offset=offset)
+    return [
+        {"ticket_id": r.ticket_id, "conversation_id": r.conversation_id,
+         "decision": r.escalation_decision, "classification": r.classification,
+         "status": r.status, "created_at": r.created_at.isoformat()}
+        for r in runs
+    ]
+
+
+app.include_router(api)
+
 
 if __name__ == "__main__":
     import uvicorn

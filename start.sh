@@ -1,0 +1,12 @@
+#!/bin/sh
+# Single-container boot for platforms that only expose one port (e.g. HF Spaces):
+# runs the mock backend in the background and the main API+chat UI in the
+# foreground on $PORT (HF Spaces convention; defaults to 7860 to match the
+# "docker" SDK's default app_port).
+set -e
+
+python knowledge_base/ingest.py
+
+uvicorn mock_backend:app --host 0.0.0.0 --port 8000 &
+
+exec uvicorn api:app --host 0.0.0.0 --port "${PORT:-7860}"
