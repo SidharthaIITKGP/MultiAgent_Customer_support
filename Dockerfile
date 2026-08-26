@@ -17,6 +17,14 @@ RUN pip install -r requirements.txt
 COPY . .
 RUN chmod +x start.sh
 
+# Ingest the knowledge base into the image at BUILD time, not boot time.
+# Without this, every container start (every free-tier spin-down/wake, every
+# redeploy) re-downloads the embedding model and re-embeds the whole doc set
+# before the app can serve a single request — 60-90s+ of pure cold-start tax
+# on top of the actual pipeline latency. Baking it in means that cost is paid
+# once per image build, not once per visitor's first message.
+RUN python knowledge_base/ingest.py
+
 EXPOSE 8000 8001 7860
 
 # Default: single-container boot (mock backend + api in one process group) —
