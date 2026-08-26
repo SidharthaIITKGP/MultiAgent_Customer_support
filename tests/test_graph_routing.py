@@ -1,4 +1,13 @@
-from agents.graph import route_after_action
+from agents.graph import route_after_action, route_after_intake
+
+
+def test_route_after_intake_skips_to_escalation_when_ambiguous():
+    assert route_after_intake({"needs_clarification": True}) == "escalation"
+
+
+def test_route_after_intake_proceeds_to_knowledge_normally():
+    assert route_after_intake({"needs_clarification": False}) == "knowledge"
+    assert route_after_intake({}) == "knowledge"
 
 
 def test_insufficient_context_retries_when_under_limit():

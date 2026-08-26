@@ -4,13 +4,20 @@ agents/graph.py
 LangGraph StateGraph wiring all four agents together with conditional edges.
 
 Graph structure:
-  START → intake → knowledge → action → [conditional] → escalation → END
-                                   ↑                        |
-                                   └──── retry_knowledge ───┘ (max 2 retries)
+  START → intake → [conditional] → knowledge → action → [conditional] → escalation → END
+                        |              ↑                        |
+                        └── skip if ───┘──── retry_knowledge ───┘ (max 2 retries)
+                        needs_clarification
 
 Retry logic:
 - Tool failure: handled INSIDE action_agent's own ReAct loop (not a graph-level concern)
 - Insufficient context: graph routes action → knowledge (up to 2 times), then forces escalation
+
+Latency shortcut:
+- If intake determines the ticket is too ambiguous to act on (needs_clarification),
+  route straight to escalation — there's nothing for knowledge/action to usefully
+  do yet, and running them anyway would burn several sequential LLM calls just to
+  arrive at the same "please clarify" outcome. See route_after_intake.
 
 recursion_limit=15 is passed at invocation time to fail predictably, not hang.
 """
@@ -43,6 +50,23 @@ GRAPH_RECURSION_LIMIT = 15
 # ---------------------------------------------------------------------------
 # Routing function
 # ---------------------------------------------------------------------------
+
+def route_after_intake(state: SupportTicketState) -> str:
+    """
+    When the ticket itself is too ambiguous to act on (e.g. no order ID),
+    intake sets needs_clarification=True. There's nothing for knowledge_agent
+    to usefully retrieve or action_agent to act on yet, so skip straight to
+    escalation instead of burning a full RAG search + ReAct tool-calling
+    attempt (each several sequential LLM calls) just to end up asking the
+    same clarifying question anyway. This is a latency optimization, not a
+    behavior change: those two agents would very likely have landed on
+    request_info regardless, just after several times the round-trips.
+    """
+    if state.get("needs_clarification", False):
+        logger.info("route_after_intake -> escalation (needs_clarification, skipping knowledge+action)")
+        return "escalation"
+    return "knowledge"
+
 
 def route_after_action(state: SupportTicketState) -> str:
     """
@@ -100,9 +124,20 @@ def build_graph() -> StateGraph:
 
     # Fixed edges
     graph.add_edge(START, "intake")
-    graph.add_edge("intake", "knowledge")
     graph.add_edge("knowledge", "action")
     graph.add_edge("escalation", END)
+
+    # Conditional: intake → escalation directly (needs_clarification, skips
+    #              knowledge+action entirely — see route_after_intake)
+    #              intake → knowledge (normal path)
+    graph.add_conditional_edges(
+        "intake",
+        route_after_intake,
+        {
+            "knowledge": "knowledge",
+            "escalation": "escalation",
+        },
+    )
 
     # Conditional: action → knowledge (insufficient context, max 2 retries)
     #              action → escalation (complete or retry limit hit)

@@ -1,4 +1,6 @@
-from agents.escalation_agent import _compute_confidence_breakdown, _parse_escalation_json
+from langchain_core.messages import AIMessage
+
+from agents.escalation_agent import _compute_confidence_breakdown, _parse_escalation_json, run_escalation_agent
 from agents.state import ToolCallRecord
 
 
@@ -50,3 +52,29 @@ def test_parse_escalation_json_valid():
 def test_parse_escalation_json_falls_back_to_escalate_on_garbage():
     result = _parse_escalation_json("not json at all")
     assert result["decision"] == "escalate"
+
+
+def test_needs_clarification_skip_note_reaches_the_llm_prompt(install_fake_llm, monkeypatch):
+    """When intake skipped knowledge/action (needs_clarification), escalation's
+    prompt must explicitly say so and carry the clarifying_question — otherwise
+    the LLM would see empty knowledge/action results with no explanation."""
+    import memory.ticket_memory as ticket_memory
+    monkeypatch.setattr(ticket_memory, "store_ticket_resolution", lambda **kwargs: "mem-id")
+
+    fake = install_fake_llm([
+        AIMessage(content='{"decision": "request_info", '
+                           '"justification": "ticket is missing an order ID", '
+                           '"final_response": "Could you share your order ID?"}'),
+    ])
+
+    state = {
+        "ticket_id": "t1", "user_id": "u001", "ticket_text": "where is my order",
+        "needs_clarification": True, "clarifying_question": "Could you share your order ID?",
+        "react_trace": [],
+    }
+    result = run_escalation_agent(state)
+
+    assert result["escalation_decision"] == "request_info"
+    sent_prompt = fake.calls[0][1].content  # [SystemMessage, HumanMessage(context)]
+    assert "SKIPPED" in sent_prompt
+    assert "Could you share your order ID?" in sent_prompt

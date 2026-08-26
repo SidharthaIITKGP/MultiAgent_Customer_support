@@ -111,6 +111,11 @@ class SupportTicketState(TypedDict, total=False):
     intake_reasoning: str         # WHY the agent classified this way (passed to next agents)
     # Past tickets retrieved from memory — informs classification
     similar_past_tickets: List[dict]   # [{text, resolution, resolved}, ...]
+    # True when the ticket itself is too ambiguous/incomplete to act on (e.g. no
+    # order ID, unclear intent) — routes straight to escalation, skipping
+    # knowledge+action, since there's nothing to retrieve or act on yet.
+    needs_clarification: bool
+    clarifying_question: Optional[str]
 
     # ---- Knowledge Agent outputs ----
     retrieved_context: str        # Concatenated top-k chunks

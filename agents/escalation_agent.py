@@ -184,6 +184,19 @@ def run_escalation_agent(state: SupportTicketState, config=None) -> dict:
     else:
         tool_summary = "  No tool calls made.\n"
 
+    skip_note = ""
+    if state.get("needs_clarification", False):
+        skip_note = (
+            "\nNOTE: knowledge_agent and action_agent were SKIPPED. intake_agent "
+            "determined this ticket is too ambiguous/incomplete to retrieve policy "
+            "context or take action on yet (e.g. missing an order ID or unclear "
+            "intent). The intended clarifying question is:\n"
+            f'  "{state.get("clarifying_question") or "Could you share more details about what you need help with?"}"\n'
+            "Decision should be request_info, using that question as (or the basis "
+            "for) final_response — do not treat the empty knowledge/action results "
+            "below as failures.\n"
+        )
+
     context = f"""=== TICKET INFO ===
 Ticket ID: {state.get('ticket_id', 'unknown')}
 User ID: {state.get('user_id', 'unknown')}
@@ -194,7 +207,7 @@ Classification: {state.get('classification', '?')} | Urgency: {state.get('urgenc
 Confidence: {state.get('classification_confidence', 0):.2f}
 Reasoning: {state.get('intake_reasoning', 'N/A')}
 Past similar tickets: {len(state.get('similar_past_tickets', []))} found
-
+{skip_note}
 === KNOWLEDGE AGENT RESULT ===
 Retrieval relevance: {state.get('retrieval_relevance_score', 0):.3f}
 RAG iterations: {state.get('rag_iterations', 0)}

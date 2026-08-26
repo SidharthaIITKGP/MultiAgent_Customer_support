@@ -273,6 +273,8 @@ Revise your JSON classification. If still uncertain, set needs_clarification=tru
         "knowledge_retry_count": 0,
         "tool_calls_made": [],
         "insufficient_context": False,
+        "needs_clarification": bool(classification_data.get("needs_clarification", False)),
+        "clarifying_question": classification_data.get("clarifying_question"),
     }
 
 
