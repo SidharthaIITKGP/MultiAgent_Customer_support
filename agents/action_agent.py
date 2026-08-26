@@ -264,6 +264,8 @@ def run_action_agent(state: SupportTicketState, config=None) -> dict:
     action_result = "No action taken."
     action_success = False
     insufficient_context = False
+    loop_completed_cleanly = False  # True only if the model gave a final answer
+                                     # (no tool calls) rather than hitting MAX_ITERATIONS
 
     logger.info("action_agent start model=%s max_iterations=%d", MODEL_NAME, MAX_ITERATIONS)
 
@@ -296,6 +298,7 @@ def run_action_agent(state: SupportTicketState, config=None) -> dict:
             logger.debug("OBSERVATION: %s...", observation[:200])
             action_result = thought
             action_success = True  # Completed without error
+            loop_completed_cleanly = True
             break
 
         # Process tool calls
@@ -372,8 +375,21 @@ def run_action_agent(state: SupportTicketState, config=None) -> dict:
     # ---------------------------------------------------------------------------
     # Post-loop: evaluate whether retrieved context was sufficient
     # ---------------------------------------------------------------------------
-    # Ask the LLM to reflect on whether the knowledge context covered what it needed
-    context_eval_prompt = f"""Reflect on the actions you just took.
+    # This costs one extra sequential LLM round-trip, so skip it in the common
+    # case where nothing indicates a problem: the loop ended with a clean final
+    # answer (not cut off by MAX_ITERATIONS) and every tool call that was made
+    # succeeded (vacuously true if none were made — e.g. a ticket that needed
+    # no tools at all). If the task actually got done cleanly, there's no
+    # realistic signal that policy context was missing; if anything failed or
+    # the loop ran out of iterations, we still ask the LLM to reflect on why.
+    all_tools_succeeded = all(tc.success for tc in tool_calls_made)
+
+    if loop_completed_cleanly and all_tools_succeeded:
+        insufficient_context = False
+        context_eval_reason = "Skipped: task completed cleanly with no tool failures."
+    else:
+        # Ask the LLM to reflect on whether the knowledge context covered what it needed
+        context_eval_prompt = f"""Reflect on the actions you just took.
 
 The knowledge_agent retrieved this context:
 ---
@@ -383,7 +399,7 @@ The knowledge_agent retrieved this context:
 Knowledge reasoning: {state.get('knowledge_reasoning', 'N/A')}
 
 Question: Was this retrieved context sufficient for you to complete the task?
-- Did you need policy information (e.g., refund eligibility rules, eligibility windows, 
+- Did you need policy information (e.g., refund eligibility rules, eligibility windows,
   account policy) that was NOT present in the retrieved context?
 - Or did you have everything you needed?
 
@@ -393,25 +409,25 @@ Respond with EXACTLY this JSON format:
   "reason": "brief explanation of what was missing (if insufficient) or confirmation (if sufficient)"
 }}"""
 
-    eval_response = build_llm(config, model=MODEL_NAME, temperature=0, max_output_tokens=512).invoke([
-        SystemMessage(content="You are evaluating whether retrieved context was sufficient."),
-        HumanMessage(content=context_eval_prompt),
-    ])
+        eval_response = build_llm(config, model=MODEL_NAME, temperature=0, max_output_tokens=512).invoke([
+            SystemMessage(content="You are evaluating whether retrieved context was sufficient."),
+            HumanMessage(content=context_eval_prompt),
+        ])
 
-    eval_text = extract_text(eval_response.content)
-    insufficient_context = False
-    context_eval_reason = "Context evaluation not parseable."
+        eval_text = extract_text(eval_response.content)
+        insufficient_context = False
+        context_eval_reason = "Context evaluation not parseable."
 
-    try:
-        # Strip markdown code fences (Gemini wraps JSON in ```json ... ```)
-        cleaned = re.sub(r'```(?:json)?\s*', '', eval_text).strip().rstrip('`').strip()
-        json_match = re.search(r'\{.*?\}', cleaned, re.DOTALL)
-        if json_match:
-            eval_json = json.loads(json_match.group())
-            insufficient_context = bool(eval_json.get("insufficient_context", False))
-            context_eval_reason = eval_json.get("reason", "")
-    except Exception as e:
-        logger.warning("context sufficiency eval unparseable: %s", e)
+        try:
+            # Strip markdown code fences (Gemini wraps JSON in ```json ... ```)
+            cleaned = re.sub(r'```(?:json)?\s*', '', eval_text).strip().rstrip('`').strip()
+            json_match = re.search(r'\{.*?\}', cleaned, re.DOTALL)
+            if json_match:
+                eval_json = json.loads(json_match.group())
+                insufficient_context = bool(eval_json.get("insufficient_context", False))
+                context_eval_reason = eval_json.get("reason", "")
+        except Exception as e:
+            logger.warning("context sufficiency eval unparseable: %s", e)
 
     # Add a final reflection step to the trace
     new_trace_steps.append(ReActStep(

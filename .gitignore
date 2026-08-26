@@ -142,7 +142,11 @@ cython_debug/
 
 # Local databases and Chroma DB
 chroma_db/
+data/
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 
 # Frontend dependencies and builds
 frontend/node_modules/

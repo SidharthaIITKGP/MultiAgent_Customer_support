@@ -53,16 +53,17 @@
 
 <dialog id="settings">
   <h3 style="margin-top:0;">Settings</h3>
-  <label>Access code (required)</label>
+  <label>Access code</label>
   <input id="apiKey" type="password" placeholder="X-API-Key for this demo" />
-  <div class="hint">Ask the person who shared this demo for the access code.</div>
+  <div class="hint">Pre-filled with the public demo code — only change this if you were given a different one.</div>
 
   <label>Your Gemini API key (optional)</label>
   <input id="geminiKey" type="password" placeholder="Bring your own key" />
   <div class="hint">Stored only in this browser, sent directly to power your own requests, never saved on the server. Get a free key at ai.google.dev.</div>
 
   <label>User ID</label>
-  <input id="userId" type="text" placeholder="u_web" />
+  <input id="userId" type="text" placeholder="u001" />
+  <div class="hint">Defaults to a mock account with a real order (u001) so refund/order actions work out of the box.</div>
 
   <div class="row">
     <button id="clearKeys">Clear</button>
@@ -77,9 +78,16 @@ const settingsDialog = $('settings');
 
 let conversationId = localStorage.getItem('conversationId') || null;
 
+// Public-demo defaults so any visitor can chat with zero setup — the server
+// side must be configured with the matching API_KEYS value for DEFAULT_ACCESS_CODE
+// to actually work. The Gemini key is deliberately NOT defaulted: that one
+// stays opt-in BYOK, since it's tied to real per-visitor cost/credentials.
+const DEFAULT_ACCESS_CODE = 'public-demo-2026';
+const DEFAULT_USER_ID = 'u001';
+
 function headers() {
   const h = { 'Content-Type': 'application/json' };
-  const apiKey = localStorage.getItem('apiKey');
+  const apiKey = localStorage.getItem('apiKey') || DEFAULT_ACCESS_CODE;
   const geminiKey = localStorage.getItem('geminiKey');
   if (apiKey) h['X-API-Key'] = apiKey;
   if (geminiKey) h['X-Gemini-Api-Key'] = geminiKey;
@@ -108,7 +116,7 @@ function showError(msg) {
 
 async function ensureConversation() {
   if (conversationId) return conversationId;
-  const userId = localStorage.getItem('userId') || 'u_web';
+  const userId = localStorage.getItem('userId') || DEFAULT_USER_ID;
   const res = await fetch('/api/conversations', {
     method: 'POST', headers: headers(), body: JSON.stringify({ user_id: userId }),
   });
@@ -122,10 +130,6 @@ async function ensureConversation() {
 async function send() {
   const text = textEl.value.trim();
   if (!text) return;
-  if (!localStorage.getItem('apiKey')) {
-    settingsDialog.showModal();
-    return;
-  }
   showError('');
   addMessage('user', text);
   textEl.value = '';
@@ -194,29 +198,29 @@ textEl.addEventListener('keydown', (e) => {
 });
 
 $('settingsBtn').addEventListener('click', () => {
-  $('apiKey').value = localStorage.getItem('apiKey') || '';
+  $('apiKey').value = localStorage.getItem('apiKey') || DEFAULT_ACCESS_CODE;
   $('geminiKey').value = localStorage.getItem('geminiKey') || '';
-  $('userId').value = localStorage.getItem('userId') || '';
+  $('userId').value = localStorage.getItem('userId') || DEFAULT_USER_ID;
   settingsDialog.showModal();
 });
 $('saveSettings').addEventListener('click', () => {
-  localStorage.setItem('apiKey', $('apiKey').value.trim());
+  localStorage.setItem('apiKey', $('apiKey').value.trim() || DEFAULT_ACCESS_CODE);
   localStorage.setItem('geminiKey', $('geminiKey').value.trim());
-  localStorage.setItem('userId', $('userId').value.trim() || 'u_web');
+  localStorage.setItem('userId', $('userId').value.trim() || DEFAULT_USER_ID);
   settingsDialog.close();
   showError('');
 });
 $('clearKeys').addEventListener('click', () => {
   localStorage.removeItem('apiKey');
   localStorage.removeItem('geminiKey');
-  $('apiKey').value = ''; $('geminiKey').value = '';
+  localStorage.removeItem('userId');
+  $('apiKey').value = DEFAULT_ACCESS_CODE; $('geminiKey').value = ''; $('userId').value = DEFAULT_USER_ID;
 });
 
-if (!localStorage.getItem('apiKey')) {
-  settingsDialog.showModal();
-} else {
-  addMessage('assistant', 'Hi! Tell me what you need help with — an order, a refund, your account, anything.');
-}
+// No setup gate: DEFAULT_ACCESS_CODE + DEFAULT_USER_ID make the app usable
+// immediately for any visitor. Settings remain available for anyone who wants
+// their own access code, a different mock user, or to add their own Gemini key.
+addMessage('assistant', 'Hi! Tell me what you need help with — an order, a refund, your account, anything.');
 </script>
 </body>
 </html>
